@@ -5,7 +5,7 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
-    LabeledPrice, PreCheckoutQuery, FSInputFile
+    LabeledPrice, PreCheckoutQuery
 )
 from aiogram.fsm.storage.memory import MemoryStorage
 
@@ -20,6 +20,9 @@ dp = Dispatcher(storage=MemoryStorage())
 db = Database()
 
 VIDEO_FILE_PATH = "video_file_id.txt"
+
+# Хранилище для группировки фото { user_id: {"photos": [], "task": asyncio.Task} }
+pending_groups: dict = {}
 
 
 def get_file_id() -> str | None:
@@ -78,7 +81,7 @@ async def cmd_start(message: Message):
 
 
 # ─────────────────────────────────────────────
-#  ПЛАТНАЯ ПОКУПКА (Telegram Stars)
+#  ПЛАТНАЯ ПОКУПКА
 # ─────────────────────────────────────────────
 
 @dp.callback_query(F.data == "buy_stars")
@@ -139,14 +142,56 @@ async def free_option(call: CallbackQuery):
 
 
 # ─────────────────────────────────────────────
-#  ПРИЁМ СКРИНШОТОВ
+#  ГРУППИРОВКА ФОТО И ОТПРАВКА АДМИНУ
 # ─────────────────────────────────────────────
 
-@dp.message(F.media_group_id | F.photo)
-async def receive_screenshots(message: Message):
+async def flush_photos(user_id: int, username: str, full_name: str):
+    """Вызывается через 3 сек после последнего фото — отправляет всё админу."""
+    await asyncio.sleep(3)
+
+    group = pending_groups.pop(user_id, None)
+    if not group:
+        return
+
+    photo_ids = group["photo_ids"]
+    count = len(photo_ids)
+
+    if await db.has_pending_request(user_id):
+        await bot.send_message(user_id, "⏳ Твоя заявка уже на рассмотрении. Подожди ответа!")
+        return
+
+    request_id = await db.create_request(user_id, 0)
+    await db.set_user_state(user_id, "request_sent")
+
+    await bot.send_message(
+        user_id,
+        f"📨 Получил {count} скриншотов! Ожидай ответа от администратора ⏳"
+    )
+
+    # Отправляем медиагруппу админу
+    from aiogram.types import InputMediaPhoto
+    media = [InputMediaPhoto(media=pid) for pid in photo_ids]
+
+    # Telegram позволяет до 10 фото в группе
+    await bot.send_media_group(ADMIN_ID, media=media)
+
+    await bot.send_message(
+        ADMIN_ID,
+        f"📸 <b>Новая заявка #{request_id}</b>\n\n"
+        f"👤 {full_name}\n"
+        f"🔗 @{username}\n"
+        f"🆔 <code>{user_id}</code>\n"
+        f"🖼 Скриншотов: {count}",
+        parse_mode="HTML",
+        reply_markup=admin_keyboard(user_id, request_id)
+    )
+
+
+@dp.message(F.photo)
+async def receive_photo(message: Message):
     user_id = message.from_user.id
 
-    # Если это админ загружает файл
+    # Если это админ загружает файл — пропускаем
     if user_id == ADMIN_ID:
         state = await db.get_user_state(user_id)
         if state == "waiting_file":
@@ -156,30 +201,23 @@ async def receive_screenshots(message: Message):
     if state != "waiting_screenshots":
         return
 
-    if await db.has_pending_request(user_id):
-        await message.answer("⏳ Твоя заявка уже на рассмотрении. Подожди ответа администратора!")
-        return
-
-    request_id = await db.create_request(user_id, message.message_id)
-    await db.set_user_state(user_id, "request_sent")
-
-    await message.answer("📨 Скриншоты получены! Ожидай ответа от администратора ⏳")
-
     username = message.from_user.username or "без ника"
     full_name = message.from_user.full_name
 
-    await bot.send_message(
-        ADMIN_ID,
-        f"📸 <b>Новая заявка на бесплатное получение!</b>\n\n"
-        f"👤 Имя: {full_name}\n"
-        f"🔗 Username: @{username}\n"
-        f"🆔 ID: <code>{user_id}</code>\n"
-        f"📋 Заявка #{request_id}\n\n"
-        f"Проверь скриншоты ниже 👇",
-        parse_mode="HTML",
-        reply_markup=admin_keyboard(user_id, request_id)
-    )
-    await bot.forward_message(ADMIN_ID, message.chat.id, message.message_id)
+    # Берём лучшее качество фото
+    photo_id = message.photo[-1].file_id
+
+    if user_id not in pending_groups:
+        pending_groups[user_id] = {"photo_ids": [], "task": None}
+
+    pending_groups[user_id]["photo_ids"].append(photo_id)
+
+    # Отменяем предыдущий таймер и запускаем новый
+    if pending_groups[user_id]["task"]:
+        pending_groups[user_id]["task"].cancel()
+
+    task = asyncio.create_task(flush_photos(user_id, username, full_name))
+    pending_groups[user_id]["task"] = task
 
 
 # ─────────────────────────────────────────────
@@ -191,9 +229,7 @@ async def admin_setfile_start(call: CallbackQuery):
     if call.from_user.id != ADMIN_ID:
         return
     await db.set_user_state(ADMIN_ID, "waiting_file")
-    await call.message.answer(
-        "📁 Отправь мне ZIP-файл с видео — я его сохраню и буду отправлять всем покупателям."
-    )
+    await call.message.answer("📁 Отправь мне ZIP-файл с видео.")
     await call.answer()
 
 
@@ -220,8 +256,7 @@ async def receive_file(message: Message):
 
     await message.answer(
         f"✅ <b>Файл сохранён!</b>\n\n"
-        f"📁 Название: {file_name}\n"
-        f"🆔 File ID: <code>{file_id}</code>\n\n"
+        f"📁 Название: {file_name}\n\n"
         f"Теперь все покупатели будут получать этот файл.",
         parse_mode="HTML"
     )
@@ -254,7 +289,7 @@ async def approve_request(call: CallbackQuery):
         call.message.text + f"\n\n✅ <b>Заявка #{request_id} одобрена!</b>",
         parse_mode="HTML"
     )
-    await call.answer("✅ Заявка одобрена, видео отправлено!")
+    await call.answer("✅ Одобрено!")
 
 
 @dp.callback_query(F.data.startswith("reject_"))
@@ -272,7 +307,7 @@ async def reject_request(call: CallbackQuery):
     await bot.send_message(
         user_id,
         "❌ <b>Ваша заявка отклонена.</b>\n\n"
-        "Если ты выполнил задание — попробуй снова, убедившись, что все 10 скриншотов отправлены одним сообщением.",
+        "Попробуй снова — убедись что все 10 скриншотов отправлены.",
         parse_mode="HTML"
     )
 
@@ -280,7 +315,7 @@ async def reject_request(call: CallbackQuery):
         call.message.text + f"\n\n❌ <b>Заявка #{request_id} отклонена.</b>",
         parse_mode="HTML"
     )
-    await call.answer("❌ Заявка отклонена!")
+    await call.answer("❌ Отклонено!")
 
 
 # ─────────────────────────────────────────────
@@ -291,8 +326,7 @@ async def reject_request(call: CallbackQuery):
 async def admin_panel(message: Message):
     if message.from_user.id != ADMIN_ID:
         return
-    file_id = get_file_id()
-    file_status = "✅ Загружен" if file_id else "❌ Не загружен"
+    file_status = "✅ Загружен" if get_file_id() else "❌ Не загружен"
     await message.answer(
         f"🛠 <b>Панель администратора</b>\n\n"
         f"📁 Файл с видео: {file_status}\n\n"
@@ -331,20 +365,16 @@ async def admin_pending(call: CallbackQuery):
         return
     text = "📋 <b>Заявки на рассмотрении:</b>\n\n"
     for r in requests:
-        text += f"🆔 ID: <code>{r['user_id']}</code> | @{r['username']} | Заявка #{r['id']}\n"
+        text += f"🆔 <code>{r['user_id']}</code> | @{r['username']} | Заявка #{r['id']}\n"
     await call.message.answer(text, parse_mode="HTML")
     await call.answer()
 
 
 @dp.callback_query(F.data == "admin_broadcast")
-async def admin_broadcast_start(call: CallbackQuery):
+async def admin_broadcast_cb(call: CallbackQuery):
     if call.from_user.id != ADMIN_ID:
         return
-    await call.message.answer(
-        "📢 Отправь текст для рассылки командой:\n\n"
-        "<code>/broadcast Текст рассылки</code>",
-        parse_mode="HTML"
-    )
+    await call.message.answer("📢 Используй команду:\n\n<code>/broadcast Текст</code>", parse_mode="HTML")
     await call.answer()
 
 
@@ -354,24 +384,19 @@ async def broadcast(message: Message):
         return
     text = message.text.removeprefix("/broadcast").strip()
     if not text:
-        await message.answer("❗ Укажи текст: /broadcast Текст")
+        await message.answer("❗ /broadcast Текст")
         return
     users = await db.get_all_users()
     sent, failed = 0, 0
-    await message.answer(f"📢 Начинаю рассылку для {len(users)} пользователей...")
-    for user_id in users:
+    await message.answer(f"📢 Рассылка для {len(users)} пользователей...")
+    for uid in users:
         try:
-            await bot.send_message(user_id, text)
+            await bot.send_message(uid, text)
             sent += 1
             await asyncio.sleep(0.05)
         except Exception:
             failed += 1
-    await message.answer(
-        f"✅ Рассылка завершена!\n"
-        f"📤 Отправлено: <b>{sent}</b>\n"
-        f"❌ Ошибок: <b>{failed}</b>",
-        parse_mode="HTML"
-    )
+    await message.answer(f"✅ Готово! Отправлено: <b>{sent}</b> | Ошибок: <b>{failed}</b>", parse_mode="HTML")
 
 
 @dp.message(Command("stats"))
@@ -380,28 +405,11 @@ async def cmd_stats(message: Message):
         return
     stats = await db.get_stats()
     await message.answer(
-        f"📊 <b>Статистика</b>\n\n"
-        f"👥 Пользователей: <b>{stats['total_users']}</b>\n"
-        f"💰 Купили за Stars: <b>{stats['paid_users']}</b>\n"
-        f"📋 Заявок: {stats['total_requests']} (⏳{stats['pending_requests']} / ✅{stats['approved_requests']} / ❌{stats['rejected_requests']})",
+        f"📊 Пользователей: <b>{stats['total_users']}</b>\n"
+        f"💰 Купили: <b>{stats['paid_users']}</b>\n"
+        f"📋 Заявок: {stats['total_requests']} (⏳{stats['pending_requests']} ✅{stats['approved_requests']} ❌{stats['rejected_requests']})",
         parse_mode="HTML"
     )
-
-
-@dp.message(Command("users"))
-async def cmd_users(message: Message):
-    if message.from_user.id != ADMIN_ID:
-        return
-    users = await db.get_all_users_info()
-    if not users:
-        await message.answer("Пользователей пока нет.")
-        return
-    text = "👥 <b>Список пользователей:</b>\n\n"
-    for u in users[:50]:
-        text += f"• <code>{u['user_id']}</code> @{u['username'] or '—'}\n"
-    if len(users) > 50:
-        text += f"\n... и ещё {len(users) - 50}"
-    await message.answer(text, parse_mode="HTML")
 
 
 # ─────────────────────────────────────────────
@@ -411,22 +419,18 @@ async def cmd_users(message: Message):
 async def send_video(chat_id: int):
     file_id = get_file_id()
     if not file_id:
-        await bot.send_message(
-            chat_id,
-            "⚠️ Файл с видео временно недоступен. Напиши администратору."
-        )
-        await bot.send_message(ADMIN_ID, f"⚠️ Попытка отправить файл пользователю {chat_id}, но файл не загружен!")
+        await bot.send_message(chat_id, "⚠️ Файл временно недоступен. Напиши администратору.")
+        await bot.send_message(ADMIN_ID, f"⚠️ Файл не загружен! Пользователь {chat_id} не получил видео.")
         return
     try:
         await bot.send_document(
-            chat_id,
-            file_id,
+            chat_id, file_id,
             caption="📁 <b>Папка с видео из Казани — Пантера</b>\n\nНаслаждайся! 🎬🔥",
             parse_mode="HTML"
         )
     except Exception as e:
-        logger.error(f"Ошибка отправки файла для {chat_id}: {e}")
-        await bot.send_message(chat_id, "⚠️ Произошла ошибка при отправке файла. Напиши администратору.")
+        logger.error(f"Ошибка отправки {chat_id}: {e}")
+        await bot.send_message(chat_id, "⚠️ Ошибка отправки файла. Напиши администратору.")
         await bot.send_message(ADMIN_ID, f"⚠️ Ошибка отправки файла пользователю {chat_id}: {e}")
 
 
